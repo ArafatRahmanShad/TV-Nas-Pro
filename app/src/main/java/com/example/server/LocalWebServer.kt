@@ -41,16 +41,29 @@ class LocalWebServer(
         fun getDeviceIpAddress(): String {
             try {
                 val interfaces = NetworkInterface.getNetworkInterfaces()
+                val candidateIps = mutableListOf<String>()
+
                 while (interfaces.hasMoreElements()) {
                     val networkInterface = interfaces.nextElement()
                     if (networkInterface.isLoopback || !networkInterface.isUp) continue
                     val addresses = networkInterface.inetAddresses
+                    val name = networkInterface.name.lowercase()
+
                     while (addresses.hasMoreElements()) {
                         val addr = addresses.nextElement()
                         if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                            return addr.hostAddress ?: "127.0.0.1"
+                            val host = addr.hostAddress ?: continue
+                            // Prioritize real LAN addresses (Wi-Fi or Ethernet)
+                            if (name.startsWith("wlan") || name.startsWith("eth") || name.startsWith("en")) {
+                                return host
+                            }
+                            candidateIps.add(host)
                         }
                     }
+                }
+
+                if (candidateIps.isNotEmpty()) {
+                    return candidateIps.first()
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -71,7 +84,7 @@ class LocalWebServer(
             try {
                 serverSocket = ServerSocket(port)
                 isRunning = true
-                Log.d(TAG, "LocalWebServer started on port $port")
+                Log.d(TAG, "LocalWebServer started successfully on 0.0.0.0:$port")
 
                 while (isRunning && serverSocket != null && !serverSocket!!.isClosed) {
                     val clientSocket = serverSocket!!.accept()
@@ -81,7 +94,7 @@ class LocalWebServer(
                 }
             } catch (e: Exception) {
                 if (isRunning) {
-                    Log.e(TAG, "Server socket error", e)
+                    Log.e(TAG, "Server socket error on port $port", e)
                 }
             } finally {
                 isRunning = false
@@ -102,14 +115,14 @@ class LocalWebServer(
     private fun handleClient(socket: Socket) {
         try {
             socket.use { s ->
-                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+                val reader = BufferedReader(InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8))
                 val out = s.getOutputStream()
 
                 val requestLine = reader.readLine() ?: return
                 val parts = requestLine.split(" ")
                 if (parts.size < 2) return
 
-                val method = parts[0]
+                val method = parts[0].uppercase()
                 val fullPath = parts[1]
                 val path = fullPath.substringBefore("?")
                 val queryString = if (fullPath.contains("?")) fullPath.substringAfter("?") else ""
@@ -128,6 +141,12 @@ class LocalWebServer(
                             contentLength = value.toIntOrNull() ?: 0
                         }
                     }
+                }
+
+                // Handle CORS preflight immediately
+                if (method == "OPTIONS") {
+                    sendResponse(out, 200, "text/plain", "OK")
+                    return
                 }
 
                 // Read body if present
@@ -158,25 +177,52 @@ class LocalWebServer(
     }
 
     private fun handleAddDownload(queryString: String, body: String, out: OutputStream) {
-        val params = parseQueryParams(if (queryString.isNotEmpty()) queryString else body)
-        val url = params["url"] ?: params["link"]
+        var url: String? = null
+        var threads = 8
+
+        // 1. Try JSON body
+        if (body.startsWith("{") && body.contains("\"url\"")) {
+            val regex = Regex("\"url\"\\s*:\\s*\"([^\"]+)\"")
+            url = regex.find(body)?.groupValues?.get(1)
+            val threadRegex = Regex("\"threads\"\\s*:\\s*(\\d+)")
+            threads = threadRegex.find(body)?.groupValues?.get(1)?.toIntOrNull() ?: 8
+        }
+
+        // 2. Try URL parameter extraction
+        if (url.isNullOrEmpty()) {
+            val source = if (queryString.isNotEmpty()) queryString else body
+            if (source.contains("url=")) {
+                val raw = source.substringAfter("url=").substringBefore("&threads=")
+                url = try {
+                    URLDecoder.decode(raw, StandardCharsets.UTF_8.name())
+                } catch (e: Exception) {
+                    raw
+                }
+            } else if (source.contains("link=")) {
+                val raw = source.substringAfter("link=").substringBefore("&threads=")
+                url = try {
+                    URLDecoder.decode(raw, StandardCharsets.UTF_8.name())
+                } catch (e: Exception) {
+                    raw
+                }
+            }
+        }
 
         if (!url.isNullOrEmpty()) {
-            val connections = params["threads"]?.toIntOrNull() ?: 8
-            val added = DownloadRepository.addDownload(context, url, connections)
-            val json = """{"status":"ok","message":"Download queued","id":"${added.id}","file":"${added.fileName}"}"""
+            val added = DownloadRepository.addDownload(context, url.trim(), threads)
+            val json = """{"status":"ok","message":"Download queued on TV","id":"${added.id}","file":"${escapeJson(added.fileName)}"}"""
             sendResponse(out, 200, "application/json", json)
         } else {
-            sendResponse(out, 400, "application/json", """{"status":"error","message":"Missing 'url' parameter"}""")
+            sendResponse(out, 400, "application/json", """{"status":"error","message":"No valid URL or Magnet link provided"}""")
         }
     }
 
     private fun handleAction(queryString: String, body: String, out: OutputStream) {
-        val params = parseQueryParams(if (queryString.isNotEmpty()) queryString else body)
-        val id = params["id"]
-        val action = params["action"]?.lowercase()
+        val source = if (queryString.isNotEmpty()) queryString else body
+        val id = source.substringAfter("id=").substringBefore("&")
+        val action = source.substringAfter("action=").substringBefore("&").lowercase()
 
-        if (!id.isNullOrEmpty() && !action.isNullOrEmpty()) {
+        if (id.isNotEmpty() && action.isNotEmpty()) {
             when (action) {
                 "pause" -> DownloadRepository.pauseDownload(id)
                 "resume" -> DownloadRepository.resumeDownload(id)
@@ -212,7 +258,7 @@ class LocalWebServer(
         {
             "tvIp":"${getDeviceIpAddress()}",
             "storagePath":"${escapeJson(StorageManager.getDownloadPath(context))}",
-            "storageFree":"${storage?.formattedFree ?: "Unknown"}",
+            "storageFree":"${storage?.formattedFree ?: "Available"}",
             "downloads":[$itemsJson]
         }
         """.trimIndent()
@@ -228,10 +274,10 @@ class LocalWebServer(
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-            <title>TV NAS Pro - Remote Control</title>
+            <title>TV NAS Pro - Mobile Remote</title>
             <style>
                 :root {
-                    --bg: #0b0f19;
+                    --bg: #070b14;
                     --card: #151d2f;
                     --primary: #38bdf8;
                     --primary-hover: #0284c7;
@@ -241,38 +287,40 @@ class LocalWebServer(
                     --success: #10b981;
                 }
                 * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-                body { background: var(--bg); color: var(--text); padding: 16px; }
+                body { background: var(--bg); color: var(--text); padding: 16px; min-height: 100vh; }
                 .container { max-width: 600px; margin: 0 auto; }
                 header { display: flex; align-items: center; justify-content: space-between; padding-bottom: 16px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
                 .logo { font-size: 20px; font-weight: 700; color: var(--primary); display: flex; align-items: center; gap: 8px; }
-                .badge { background: #064e3b; color: #34d399; font-size: 11px; padding: 4px 8px; border-radius: 12px; font-weight: 600; }
+                .badge { background: #064e3b; color: #34d399; font-size: 11px; padding: 4px 10px; border-radius: 12px; font-weight: 600; }
                 .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; margin-bottom: 20px; }
                 h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text); }
                 textarea, input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: #0c1322; color: #fff; font-size: 14px; resize: none; margin-bottom: 12px; outline: none; }
                 textarea:focus, input:focus { border-color: var(--primary); }
-                .btn { display: inline-flex; align-items: center; justify-content: center; width: 100%; padding: 12px; border-radius: 8px; border: none; background: var(--primary); color: #0f172a; font-weight: 600; font-size: 15px; cursor: pointer; transition: 0.2s; }
+                .btn { display: inline-flex; align-items: center; justify-content: center; width: 100%; padding: 14px; border-radius: 8px; border: none; background: var(--primary); color: #070b14; font-weight: 700; font-size: 15px; cursor: pointer; transition: 0.2s; }
                 .btn:active { background: var(--primary-hover); transform: scale(0.98); }
-                .item-card { background: #0f172a; border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+                .item-card { background: #0b1120; border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
                 .item-header { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; font-weight: 600; }
                 .item-stats { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-sec); margin-top: 6px; }
                 .progress-bar-bg { width: 100%; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; margin-top: 8px; }
                 .progress-bar-fill { height: 100%; background: var(--primary); transition: width 0.3s; }
                 .actions { display: flex; gap: 8px; margin-top: 10px; }
-                .btn-sm { flex: 1; padding: 6px; border-radius: 6px; border: 1px solid var(--border); background: #1e293b; color: #fff; font-size: 12px; cursor: pointer; }
-                .quick-btns { display: flex; gap: 8px; margin-top: 8px; }
-                .quick-btn { flex: 1; padding: 6px 8px; font-size: 11px; border: 1px solid var(--border); border-radius: 6px; background: #111a2d; color: var(--text-sec); cursor: pointer; }
+                .btn-sm { flex: 1; padding: 8px; border-radius: 6px; border: 1px solid var(--border); background: #1e293b; color: #fff; font-size: 12px; cursor: pointer; font-weight: 600; }
+                .quick-btns { display: flex; gap: 8px; margin-top: 10px; }
+                .quick-btn { flex: 1; padding: 8px; font-size: 11px; border: 1px solid var(--border); border-radius: 6px; background: #111a2d; color: var(--text-sec); cursor: pointer; }
+                .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #10b981; color: #000; padding: 10px 20px; border-radius: 20px; font-weight: 600; display: none; z-index: 100; }
             </style>
         </head>
         <body>
+            <div id="toast" class="toast">Link pushed to TV!</div>
             <div class="container">
                 <header>
                     <div class="logo">⚡ TV NAS Pro</div>
-                    <div class="badge">Connected to $ip:8080</div>
+                    <div class="badge">Connected: $ip:8080</div>
                 </header>
 
                 <div class="card">
                     <h2>Push Download to TV</h2>
-                    <textarea id="urlInput" rows="3" placeholder="Paste Magnet URI or Direct HTTP/HTTPS Link..."></textarea>
+                    <textarea id="urlInput" rows="3" placeholder="Paste Magnet URI (magnet:?xt=...) or Direct HTTP/HTTPS File URL..."></textarea>
                     <button class="btn" onclick="sendDownload()">📥 Send to TV NAS</button>
                     <div class="quick-btns">
                         <button class="quick-btn" onclick="fillSample(1)">+ Big Buck Bunny (1080p MP4)</button>
@@ -287,6 +335,13 @@ class LocalWebServer(
             </div>
 
             <script>
+                function showToast(msg) {
+                    var t = document.getElementById('toast');
+                    t.innerText = msg;
+                    t.style.display = 'block';
+                    setTimeout(function() { t.style.display = 'none'; }, 2500);
+                }
+
                 function fillSample(type) {
                     if (type === 1) {
                         document.getElementById('urlInput').value = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
@@ -296,29 +351,51 @@ class LocalWebServer(
                 }
 
                 async function sendDownload() {
-                    const url = document.getElementById('urlInput').value.trim();
-                    if (!url) return alert('Please paste a download or magnet link');
+                    var url = document.getElementById('urlInput').value.trim();
+                    if (!url) return alert('Please paste a download link or magnet URI');
+
                     try {
-                        const res = await fetch('/api/add?url=' + encodeURIComponent(url));
-                        const json = await res.json();
-                        alert('Queued on TV: ' + json.file);
-                        document.getElementById('urlInput').value = '';
-                        loadStatus();
+                        var res = await fetch('/api/add', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ url: url, threads: 8 })
+                        });
+                        var json = await res.json();
+                        if (json.status === 'ok') {
+                            showToast('Queued on TV: ' + json.file);
+                            document.getElementById('urlInput').value = '';
+                            loadStatus();
+                        } else {
+                            alert('Error: ' + json.message);
+                        }
                     } catch (e) {
-                        alert('Error sending to TV: ' + e);
+                        // Fallback to GET query
+                        try {
+                            var getRes = await fetch('/api/add?url=' + encodeURIComponent(url));
+                            var getJson = await getRes.json();
+                            showToast('Queued on TV: ' + getJson.file);
+                            document.getElementById('urlInput').value = '';
+                            loadStatus();
+                        } catch (err) {
+                            alert('Could not reach TV: ' + err);
+                        }
                     }
                 }
 
                 async function doAction(id, action) {
-                    await fetch('/api/action?id=' + id + '&action=' + action);
-                    loadStatus();
+                    try {
+                        await fetch('/api/action?id=' + id + '&action=' + action);
+                        loadStatus();
+                    } catch (e) {
+                        console.error(e);
+                    }
                 }
 
                 async function loadStatus() {
                     try {
-                        const res = await fetch('/api/status');
-                        const data = await res.json();
-                        const list = document.getElementById('downloadsList');
+                        var res = await fetch('/api/status');
+                        var data = await res.json();
+                        var list = document.getElementById('downloadsList');
                         if (!data.downloads || data.downloads.length === 0) {
                             list.innerHTML = '<div style="color:#64748b; font-size:13px; text-align:center; padding:12px;">No active downloads on TV. Paste a link above!</div>';
                             return;
@@ -329,10 +406,10 @@ class LocalWebServer(
                             var actions = '';
                             if (d.status === 'DOWNLOADING') {
                                 actions += '<button class="btn-sm" onclick="doAction(\'' + d.id + '\',\'pause\')">⏸ Pause</button>';
-                            } else if (d.status === 'PAUSED') {
+                            } else if (d.status === 'PAUSED' || d.status === 'FAILED') {
                                 actions += '<button class="btn-sm" onclick="doAction(\'' + d.id + '\',\'resume\')">▶ Resume</button>';
                             }
-                            actions += '<button class="btn-sm" style="color:#f87171;" onclick="doAction(\'' + d.id + '\',\'cancel\')">✕ Cancel</button>';
+                            actions += '<button class="btn-sm" style="color:#f87171;" onclick="doAction(\'' + d.id + '\',\'cancel\')">✕ Delete</button>';
 
                             return '<div class="item-card">' +
                                 '<div class="item-header">' +
@@ -376,29 +453,13 @@ class LocalWebServer(
                 "Content-Type: $contentType\r\n" +
                 "Content-Length: ${bytes.size}\r\n" +
                 "Access-Control-Allow-Origin: *\r\n" +
+                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                "Access-Control-Allow-Headers: *\r\n" +
                 "Connection: close\r\n\r\n"
 
         out.write(header.toByteArray(StandardCharsets.UTF_8))
         out.write(bytes)
         out.flush()
-    }
-
-    private fun parseQueryParams(query: String): Map<String, String> {
-        val map = mutableMapOf<String, String>()
-        val pairs = query.split("&")
-        for (pair in pairs) {
-            val parts = pair.split("=", limit = 2)
-            if (parts.size == 2) {
-                try {
-                    val key = URLDecoder.decode(parts[0], StandardCharsets.UTF_8.name())
-                    val value = URLDecoder.decode(parts[1], StandardCharsets.UTF_8.name())
-                    map[key] = value
-                } catch (e: Exception) {
-                    map[parts[0]] = parts[1]
-                }
-            }
-        }
-        return map
     }
 
     private fun escapeJson(str: String): String {

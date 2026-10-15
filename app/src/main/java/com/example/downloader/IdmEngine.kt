@@ -4,11 +4,7 @@ import android.util.Log
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
-import java.io.File
-import java.io.InputStream
-import java.io.RandomAccessFile
-import java.net.URL
+import java.io.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -18,15 +14,18 @@ class IdmEngine(
 ) {
     companion object {
         private const val TAG = "IdmEngine"
-        private const val BUFFER_SIZE = 64 * 1024 // 64 KB buffer for high-throughput
+        private const val BUFFER_SIZE = 64 * 1024
+        private const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
+
+    private val bitTorrentEngine = BitTorrentEngine(client, onUpdate)
 
     private val activeJobs = ConcurrentHashMap<String, Job>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -40,19 +39,19 @@ class IdmEngine(
         val job = scope.launch {
             try {
                 if (item.isMagnet) {
-                    handleMagnetDownload(item)
+                    bitTorrentEngine.downloadTorrent(item)
                 } else {
                     handleHttpDownload(item)
                 }
             } catch (ce: CancellationException) {
-                Log.d(TAG, "Download ${item.id} cancelled or paused")
+                Log.d(TAG, "Download ${item.id} paused/cancelled")
                 item.status = DownloadStatus.PAUSED
                 item.speedBytesPerSec = 0L
                 onUpdate(item)
             } catch (e: Exception) {
-                Log.e(TAG, "Download ${item.id} failed", e)
+                Log.e(TAG, "Download ${item.id} error", e)
                 item.status = DownloadStatus.FAILED
-                item.errorMessage = e.message ?: "Download error"
+                item.errorMessage = e.message ?: "Download connection error"
                 item.speedBytesPerSec = 0L
                 onUpdate(item)
             } finally {
@@ -73,6 +72,9 @@ class IdmEngine(
         if (deleteFile && item != null) {
             try {
                 item.targetFile.delete()
+                for (i in 0..16) {
+                    File(item.destinationPath, "${item.fileName}.part$i").delete()
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -84,213 +86,189 @@ class IdmEngine(
         item.errorMessage = null
         onUpdate(item)
 
-        // 1. Send HEAD or Range: bytes=0-0 request to query content length & accept-ranges
-        val headReq = Request.Builder()
-            .url(item.url)
-            .header("User-Agent", "TV-NAS-Pro-IDM/3.0 (Android TV)")
-            .head()
-            .build()
-
-        var contentLength = -1L
-        var supportsRanges = false
-        var finalUrl = item.url
-
-        try {
-            client.newCall(headReq).execute().use { response ->
-                if (response.isSuccessful) {
-                    contentLength = response.header("Content-Length")?.toLongOrNull() ?: -1L
-                    val acceptRanges = response.header("Accept-Ranges")
-                    supportsRanges = acceptRanges?.equals("bytes", ignoreCase = true) == true
-                    finalUrl = response.request.url.toString()
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "HEAD request failed, falling back to GET test", e)
-        }
-
-        // If HEAD didn't yield content length, test with small GET
-        if (contentLength <= 0) {
-            try {
-                val testReq = Request.Builder()
-                    .url(item.url)
-                    .header("User-Agent", "TV-NAS-Pro-IDM/3.0 (Android TV)")
-                    .header("Range", "bytes=0-1")
-                    .get()
-                    .build()
-                client.newCall(testReq).execute().use { resp ->
-                    if (resp.code == 206) {
-                        supportsRanges = true
-                        val cr = resp.header("Content-Range")
-                        if (cr != null && cr.contains("/")) {
-                            contentLength = cr.substringAfter("/").toLongOrNull() ?: -1L
-                        }
-                    } else if (resp.isSuccessful) {
-                        contentLength = resp.header("Content-Length")?.toLongOrNull() ?: -1L
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Range test failed", e)
-            }
-        }
-
         val destinationDir = File(item.destinationPath)
         if (!destinationDir.exists()) destinationDir.mkdirs()
         val targetFile = item.targetFile
 
-        if (contentLength > 0) {
-            item.totalBytes = contentLength
+        // Probe server with range request: bytes=0-1023
+        var totalLength = -1L
+        var supportsRanges = false
+        var initialChunkBytes: ByteArray? = null
+
+        try {
+            val probeReq = Request.Builder()
+                .url(item.url)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "*/*")
+                .header("Range", "bytes=0-1023")
+                .build()
+
+            client.newCall(probeReq).execute().use { response ->
+                if (response.code == 206) {
+                    supportsRanges = true
+                    initialChunkBytes = response.body?.bytes()
+                    val contentRange = response.header("Content-Range")
+                    if (contentRange != null && contentRange.contains("/")) {
+                        totalLength = contentRange.substringAfter("/").toLongOrNull() ?: -1L
+                    }
+                } else if (response.isSuccessful) {
+                    // Range not supported, full body started
+                    supportsRanges = false
+                    totalLength = response.body?.contentLength() ?: -1L
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Probe request failed, attempting standard connection", e)
         }
 
-        // If target file doesn't exist, create it
-        if (!targetFile.exists()) {
-            targetFile.createNewFile()
-        }
-
-        // Decide whether to use multi-segmented IDM download or single-stream
-        val threads = if (supportsRanges && contentLength > 1024 * 1024) {
-            item.numConnections.coerceIn(1, 16)
-        } else {
-            1
+        if (totalLength > 0) {
+            item.totalBytes = totalLength
         }
 
         item.status = DownloadStatus.DOWNLOADING
         onUpdate(item)
 
-        if (threads > 1 && contentLength > 0) {
-            runSegmentedDownload(item, finalUrl, targetFile, contentLength, threads)
+        val threads = if (supportsRanges && totalLength > 1024 * 1024) {
+            item.numConnections.coerceIn(2, 16)
         } else {
-            runSingleStreamDownload(item, finalUrl, targetFile)
+            1
+        }
+
+        if (threads > 1 && totalLength > 0) {
+            runParallelSegmentDownload(item, targetFile, totalLength, threads)
+        } else {
+            runSequentialStreamDownload(item, targetFile, totalLength)
         }
     }
 
-    private suspend fun runSegmentedDownload(
+    /**
+     * IDM Architecture: Downloads into separate .partX files in parallel, then merges.
+     * Prevents lock collisions and works across all storage media.
+     */
+    private suspend fun runParallelSegmentDownload(
         item: DownloadItem,
-        url: String,
         targetFile: File,
         totalSize: Long,
         threads: Int
     ) = coroutineScope {
-        // Pre-allocate file size
-        RandomAccessFile(targetFile, "rw").use { raf ->
-            if (raf.length() < totalSize) {
-                raf.setLength(totalSize)
-            }
+        val chunkSize = totalSize / threads
+        val segments = mutableListOf<DownloadSegment>()
+        for (i in 0 until threads) {
+            val start = i * chunkSize
+            val end = if (i == threads - 1) totalSize - 1 else (i + 1) * chunkSize - 1
+            val partFile = File(item.destinationPath, "${item.fileName}.part$i")
+            val existingLen = if (partFile.exists()) partFile.length() else 0L
+            segments.add(DownloadSegment(i, start, end, existingLen))
         }
-
-        // Build or reuse segments
-        val segments = if (item.segments.isNotEmpty() && item.segments.size == threads) {
-            item.segments
-        } else {
-            val segList = mutableListOf<DownloadSegment>()
-            val chunkSize = totalSize / threads
-            for (i in 0 until threads) {
-                val start = i * chunkSize
-                val end = if (i == threads - 1) totalSize - 1 else (i + 1) * chunkSize - 1
-                segList.add(DownloadSegment(index = i, startByte = start, endByte = end, downloadedBytes = 0L))
-            }
-            item.segments = segList
-            segList
-        }
+        item.segments = segments
 
         val totalDownloadedAtomic = AtomicLong(segments.sumOf { it.downloadedBytes })
-        val speedTracker = SpeedTracker()
+        var lastTime = System.currentTimeMillis()
+        var lastBytes = totalDownloadedAtomic.get()
 
-        // Launch speed monitor job
-        val speedJob = launch {
+        val monitorJob = launch {
             while (isActive) {
                 delay(500)
-                val currentTotal = totalDownloadedAtomic.get()
-                val speed = speedTracker.calculateSpeed(currentTotal)
-                item.downloadedBytes = currentTotal
-                item.speedBytesPerSec = speed
+                val current = totalDownloadedAtomic.get()
+                val now = System.currentTimeMillis()
+                val diffTime = (now - lastTime).coerceAtLeast(1)
+                item.speedBytesPerSec = ((current - lastBytes) * 1000L) / diffTime
+                item.downloadedBytes = current
+                lastTime = now
+                lastBytes = current
                 onUpdate(item)
             }
         }
 
         try {
-            // Launch parallel segments
-            val segmentJobs = segments.map { segment ->
+            val segmentJobs = segments.map { seg ->
                 async(Dispatchers.IO) {
-                    downloadSegment(url, targetFile, segment, totalDownloadedAtomic)
+                    val partFile = File(item.destinationPath, "${item.fileName}.part${seg.index}")
+                    val startOffset = seg.startByte + seg.downloadedBytes
+                    if (startOffset > seg.endByte) return@async // Already complete
+
+                    val req = Request.Builder()
+                        .url(item.url)
+                        .header("User-Agent", USER_AGENT)
+                        .header("Accept", "*/*")
+                        .header("Range", "bytes=$startOffset-${seg.endByte}")
+                        .build()
+
+                    client.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful && resp.code != 206) {
+                            throw Exception("Segment ${seg.index} HTTP error: ${resp.code}")
+                        }
+                        val body = resp.body ?: throw Exception("Segment ${seg.index} empty body")
+                        val input = body.byteStream()
+                        val buffer = ByteArray(BUFFER_SIZE)
+
+                        FileOutputStream(partFile, true).use { fos ->
+                            var read: Int
+                            while (input.read(buffer).also { read = it } != -1) {
+                                fos.write(buffer, 0, read)
+                                seg.downloadedBytes += read
+                                totalDownloadedAtomic.addAndGet(read.toLong())
+                            }
+                        }
+                    }
                 }
             }
 
             segmentJobs.awaitAll()
 
-            // Completed!
+            // Merge all .partX files into targetFile
+            FileOutputStream(targetFile).use { outStream ->
+                for (i in 0 until threads) {
+                    val partFile = File(item.destinationPath, "${item.fileName}.part$i")
+                    if (partFile.exists()) {
+                        FileInputStream(partFile).use { inStream ->
+                            inStream.copyTo(outStream, BUFFER_SIZE)
+                        }
+                        partFile.delete()
+                    }
+                }
+            }
+
             item.downloadedBytes = totalSize
             item.totalBytes = totalSize
-            item.speedBytesPerSec = 0L
             item.status = DownloadStatus.COMPLETED
+            item.speedBytesPerSec = 0L
             item.completedTimestamp = System.currentTimeMillis()
             onUpdate(item)
         } finally {
-            speedJob.cancel()
+            monitorJob.cancel()
         }
     }
 
-    private fun downloadSegment(
-        url: String,
-        targetFile: File,
-        segment: DownloadSegment,
-        totalDownloadedAtomic: AtomicLong
-    ) {
-        val currentStart = segment.startByte + segment.downloadedBytes
-        if (currentStart > segment.endByte) {
-            return // Already completed segment
-        }
-
-        val req = Request.Builder()
-            .url(url)
-            .header("User-Agent", "TV-NAS-Pro-IDM/3.0 (Android TV)")
-            .header("Range", "bytes=$currentStart-${segment.endByte}")
-            .build()
-
-        client.newCall(req).execute().use { response ->
-            if (!response.isSuccessful && response.code != 206) {
-                throw Exception("Segment HTTP error: ${response.code}")
-            }
-
-            val body = response.body ?: throw Exception("Null response body for segment")
-            val inputStream: InputStream = body.byteStream()
-            val buffer = ByteArray(BUFFER_SIZE)
-
-            RandomAccessFile(targetFile, "rw").use { raf ->
-                raf.seek(currentStart)
-                var bytesRead: Int
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    raf.write(buffer, 0, bytesRead)
-                    segment.downloadedBytes += bytesRead
-                    totalDownloadedAtomic.addAndGet(bytesRead.toLong())
-                }
-            }
-        }
-    }
-
-    private suspend fun runSingleStreamDownload(
+    private suspend fun runSequentialStreamDownload(
         item: DownloadItem,
-        url: String,
-        targetFile: File
+        targetFile: File,
+        totalSize: Long
     ) = coroutineScope {
-        val existingBytes = if (targetFile.exists()) targetFile.length() else 0L
+        val existingLen = if (targetFile.exists()) targetFile.length() else 0L
         val reqBuilder = Request.Builder()
-            .url(url)
-            .header("User-Agent", "TV-NAS-Pro-IDM/3.0 (Android TV)")
+            .url(item.url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
 
-        if (existingBytes > 0) {
-            reqBuilder.header("Range", "bytes=$existingBytes-")
+        if (existingLen > 0) {
+            reqBuilder.header("Range", "bytes=$existingLen-")
         }
 
-        val speedTracker = SpeedTracker()
-        val totalDownloadedAtomic = AtomicLong(existingBytes)
+        var lastTime = System.currentTimeMillis()
+        var lastBytes = existingLen
+        val totalDownloadedAtomic = AtomicLong(existingLen)
 
-        val speedJob = launch {
+        val monitorJob = launch {
             while (isActive) {
                 delay(500)
-                val currentTotal = totalDownloadedAtomic.get()
-                val speed = speedTracker.calculateSpeed(currentTotal)
-                item.downloadedBytes = currentTotal
-                item.speedBytesPerSec = speed
+                val current = totalDownloadedAtomic.get()
+                val now = System.currentTimeMillis()
+                val diffTime = (now - lastTime).coerceAtLeast(1)
+                item.speedBytesPerSec = ((current - lastBytes) * 1000L) / diffTime
+                item.downloadedBytes = current
+                lastTime = now
+                lastBytes = current
                 onUpdate(item)
             }
         }
@@ -300,163 +278,33 @@ class IdmEngine(
                 if (!response.isSuccessful && response.code != 206) {
                     throw Exception("HTTP download error: ${response.code}")
                 }
-
-                val body = response.body ?: throw Exception("Empty response body")
+                val body = response.body ?: throw Exception("Empty body")
                 if (item.totalBytes <= 0) {
                     val len = body.contentLength()
-                    if (len > 0) {
-                        item.totalBytes = if (response.code == 206) len + existingBytes else len
-                    }
+                    if (len > 0) item.totalBytes = if (response.code == 206) len + existingLen else len
                 }
 
-                val inputStream: InputStream = body.byteStream()
+                val input = body.byteStream()
                 val buffer = ByteArray(BUFFER_SIZE)
+                val append = response.code == 206 && existingLen > 0
 
-                RandomAccessFile(targetFile, "rw").use { raf ->
-                    if (response.code == 206) {
-                        raf.seek(existingBytes)
-                    } else {
-                        raf.seek(0)
-                        raf.setLength(0)
-                        totalDownloadedAtomic.set(0)
-                    }
-
-                    var bytesRead: Int
-                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                        raf.write(buffer, 0, bytesRead)
-                        totalDownloadedAtomic.addAndGet(bytesRead.toLong())
+                FileOutputStream(targetFile, append).use { fos ->
+                    var read: Int
+                    while (input.read(buffer).also { read = it } != -1) {
+                        fos.write(buffer, 0, read)
+                        totalDownloadedAtomic.addAndGet(read.toLong())
                     }
                 }
             }
 
             item.downloadedBytes = targetFile.length()
             if (item.totalBytes <= 0) item.totalBytes = item.downloadedBytes
-            item.speedBytesPerSec = 0L
-            item.status = DownloadStatus.COMPLETED
-            item.completedTimestamp = System.currentTimeMillis()
-            onUpdate(item)
-        } finally {
-            speedJob.cancel()
-        }
-    }
-
-    private suspend fun handleMagnetDownload(item: DownloadItem) = coroutineScope {
-        item.status = DownloadStatus.CONNECTING
-        onUpdate(item)
-
-        // Parse magnet details
-        val parsed = MagnetParser.parse(item.url)
-        Log.d(TAG, "Starting Torrent Magnet: ${parsed.displayName}, Hash: ${parsed.infoHash}")
-
-        // Check if there is an active webSeed (direct HTTP mirror in magnet)
-        if (parsed.webSeeds.isNotEmpty()) {
-            val directSeed = parsed.webSeeds.first()
-            Log.d(TAG, "Using WebSeed HTTP mirror: $directSeed")
-            val directItem = item.copy(url = directSeed)
-            handleHttpDownload(directItem)
-            item.status = directItem.status
-            item.downloadedBytes = directItem.downloadedBytes
-            item.totalBytes = directItem.totalBytes
-            item.speedBytesPerSec = directItem.speedBytesPerSec
-            item.completedTimestamp = directItem.completedTimestamp
-            onUpdate(item)
-            return@coroutineScope
-        }
-
-        // Standard Torrent: Establish tracker handshake and simulate chunk peer acquisition
-        // Create the torrent target file
-        val targetDir = File(item.destinationPath)
-        if (!targetDir.exists()) targetDir.mkdirs()
-        val targetFile = item.targetFile
-        val mockSize = 750L * 1024 * 1024 // 750 MB typical video file
-        item.totalBytes = mockSize
-
-        val totalSegments = item.numConnections.coerceIn(4, 16)
-        val segList = mutableListOf<DownloadSegment>()
-        val chunkSize = mockSize / totalSegments
-        for (i in 0 until totalSegments) {
-            val start = i * chunkSize
-            val end = if (i == totalSegments - 1) mockSize - 1 else (i + 1) * chunkSize - 1
-            segList.add(DownloadSegment(index = i, startByte = start, endByte = end, downloadedBytes = 0L))
-        }
-        item.segments = segList
-
-        delay(1200) // Connecting to DHT & Trackers
-        item.status = DownloadStatus.DOWNLOADING
-        onUpdate(item)
-
-        val speedTracker = SpeedTracker()
-        val totalDownloadedAtomic = AtomicLong(0)
-
-        // Write torrent metadata descriptor
-        val metaFile = File(item.destinationPath, "${item.fileName}.torrent_info")
-        metaFile.writeText(
-            """
-            [TV NAS Pro Torrent Client]
-            DisplayName=${parsed.displayName}
-            InfoHash=${parsed.infoHash}
-            Trackers=${parsed.trackers.joinToString(",")}
-            TotalBytes=$mockSize
-            Status=ACTIVE_SEED_SWARM
-            """.trimIndent()
-        )
-
-        val speedJob = launch {
-            while (isActive) {
-                delay(500)
-                val currentTotal = totalDownloadedAtomic.get()
-                val speed = speedTracker.calculateSpeed(currentTotal)
-                item.downloadedBytes = currentTotal
-                item.speedBytesPerSec = speed
-                onUpdate(item)
-            }
-        }
-
-        try {
-            // Emulate high-speed peer download chunks
-            val targetBytes = mockSize
-            val startTime = System.currentTimeMillis()
-            val simulatedRatePerSecond = 35L * 1024 * 1024 // 35 MB/s Gigabit NAS transfer
-
-            while (totalDownloadedAtomic.get() < targetBytes) {
-                delay(300)
-                val stepBytes = (simulatedRatePerSecond * 0.3).toLong()
-                val newTotal = (totalDownloadedAtomic.get() + stepBytes).coerceAtMost(targetBytes)
-                totalDownloadedAtomic.set(newTotal)
-
-                // Update segment slices
-                val prog = newTotal.toFloat() / targetBytes.toFloat()
-                segList.forEachIndexed { idx, seg ->
-                    val segProg = (prog * totalSegments - idx).coerceIn(0f, 1f)
-                    seg.downloadedBytes = (seg.totalBytes * segProg).toLong()
-                }
-            }
-
-            // Finished torrent download -> Transitions to SEEDING state
-            item.downloadedBytes = targetBytes
-            item.totalBytes = targetBytes
             item.status = DownloadStatus.COMPLETED
             item.speedBytesPerSec = 0L
             item.completedTimestamp = System.currentTimeMillis()
             onUpdate(item)
         } finally {
-            speedJob.cancel()
+            monitorJob.cancel()
         }
-    }
-}
-
-private class SpeedTracker {
-    private var lastTime = System.currentTimeMillis()
-    private var lastBytes = 0L
-
-    fun calculateSpeed(currentBytes: Long): Long {
-        val now = System.currentTimeMillis()
-        val timeDiff = (now - lastTime).coerceAtLeast(1)
-        val bytesDiff = (currentBytes - lastBytes).coerceAtLeast(0)
-
-        lastTime = now
-        lastBytes = currentBytes
-
-        return (bytesDiff * 1000L) / timeDiff
     }
 }
