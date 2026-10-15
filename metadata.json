@@ -1,0 +1,6 @@
+{
+  "name": "TV NAS Pro",
+  "description": "Powerful TV NAS download manager with IDM-speed parallel segmented downloads, USB storage manager, media player, and remote phone control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
